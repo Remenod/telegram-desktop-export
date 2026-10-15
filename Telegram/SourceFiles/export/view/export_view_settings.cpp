@@ -57,16 +57,6 @@ constexpr auto kMegabyte = int64(1024) * 1024;
 	});
 }
 
-[[nodiscard]] bool SizeLimitFitsOptionLine(
-		int outerWidth,
-		int optionWidth,
-		int labelWidth) {
-	const auto available = outerWidth
-		- st::exportSettingPadding.left()
-		- st::exportFileSizePadding.right();
-	return (optionWidth + labelWidth <= available);
-}
-
 void ChooseFormatBox(
 		not_null<Ui::GenericBox*> box,
 		Output::Format format,
@@ -782,35 +772,49 @@ void SettingsWidget::addChatOption(
 
 void SettingsWidget::addMediaOptions(
 		not_null<Ui::VerticalLayout*> container) {
-	addMediaOption(
-		container,
-		tr::lng_export_option_photos(tr::now),
-		MediaType::Photo);
-	addMediaOption(
-		container,
-		tr::lng_export_option_video_files(tr::now),
-		MediaType::Video);
-	addMediaOption(
-		container,
+	const auto add = [&](const QString &text, MediaType type) {
+		const auto checkbox = addMediaOption(container, text, type);
+		addSizeSlider(container, checkbox, type);
+	};
+	add(tr::lng_export_option_photos(tr::now), MediaType::Photo);
+	add(tr::lng_export_option_video_files(tr::now), MediaType::Video);
+	add(
 		tr::lng_export_option_voice_messages(tr::now),
 		MediaType::VoiceMessage);
-	addMediaOption(
-		container,
+	add(
 		tr::lng_export_option_video_messages(tr::now),
 		MediaType::VideoMessage);
-	addMediaOption(
-		container,
-		tr::lng_export_option_stickers(tr::now),
-		MediaType::Sticker);
-	addMediaOption(
-		container,
-		tr::lng_export_option_gifs(tr::now),
-		MediaType::GIF);
-	const auto files = addMediaOption(
-		container,
-		tr::lng_export_option_files(tr::now),
-		MediaType::File);
-	addSizeSlider(container, files);
+	add(tr::lng_export_option_stickers(tr::now), MediaType::Sticker);
+	add(tr::lng_export_option_gifs(tr::now), MediaType::GIF);
+	add(tr::lng_export_option_files(tr::now), MediaType::File);
+	addReuseMediaOption(container);
+}
+
+void SettingsWidget::addReuseMediaOption(
+		not_null<Ui::VerticalLayout*> container) {
+	// Plain strings instead of lang keys keep the patch away from
+	// lang.strings, which changes in every release.
+	const auto checkbox = container->add(
+		object_ptr<Ui::Checkbox>(
+			container,
+			u"Reuse media from previous exports"_q,
+			readData().reusePreviousMedia,
+			st::defaultBoxCheckbox),
+		st::exportSettingPadding);
+	checkbox->checkedChanges(
+	) | rpl::on_next([=](bool checked) {
+		changeData([&](Settings &data) {
+			data.reusePreviousMedia = checked;
+		});
+	}, checkbox->lifetime());
+	container->add(
+		object_ptr<Ui::FlatLabel>(
+			container,
+			(u"Files already downloaded by earlier exports in the same "
+				"folder are hard-linked or copied instead of being "
+				"downloaded again."_q),
+			st::exportAboutOptionLabel),
+		st::exportAboutOptionPadding);
 }
 
 not_null<Ui::Checkbox*> SettingsWidget::addMediaOption(
@@ -839,64 +843,48 @@ not_null<Ui::Checkbox*> SettingsWidget::addMediaOption(
 
 void SettingsWidget::addSizeSlider(
 		not_null<Ui::VerticalLayout*> container,
-		not_null<Ui::Checkbox*> above) {
+		not_null<Ui::Checkbox*> above,
+		MediaType type) {
+	// Each media type has its own limit, shown under its checkbox.
 	const auto wrap = container->add(
-		object_ptr<Ui::FixedHeightWidget>(container));
-	const auto slider = container->add(
-		object_ptr<Ui::MediaSlider>(container, st::exportFileSizeSlider),
-		st::exportFileSizePadding);
+		object_ptr<Ui::SlideWrap<Ui::VerticalLayout>>(
+			container,
+			object_ptr<Ui::VerticalLayout>(container)));
+	const auto inner = wrap->entity();
+	inner->add(
+		object_ptr<Ui::FlatLabel>(
+			inner,
+			value() | rpl::map([=](const Settings &data) {
+				const auto limit = data.media.sizeLimitFor(type) / kMegabyte;
+				return tr::lng_export_option_size_limit(
+					tr::now,
+					lt_size,
+					QString::number(limit) + " MB");
+			}) | rpl::distinct_until_changed(),
+			st::exportAboutOptionLabel),
+		st::exportTypeSizeLabelPadding);
+	const auto slider = inner->add(
+		object_ptr<Ui::MediaSlider>(inner, st::exportFileSizeSlider),
+		st::exportTypeSizeSliderPadding);
 	slider->resize(st::exportFileSizeSlider.seekSize);
 	slider->setPseudoDiscrete(
 		kSizeValueCount,
 		SizeLimitByIndex,
-		readData().media.sizeLimit,
+		readData().media.sizeLimitFor(type),
 		[=](int64 limit) {
 			changeData([&](Settings &data) {
-				data.media.sizeLimit = limit;
+				// Pin the current limits of all types first, so that
+				// the ones not touched yet don't follow the common one.
+				for (const auto each : MediaSettings::kAllTypes) {
+					data.media.setSizeLimit(
+						each,
+						data.media.sizeLimitFor(each));
+				}
+				data.media.setSizeLimit(type, limit);
 			});
 		});
 
-	const auto label = Ui::CreateChild<Ui::LabelSimple>(
-		container.get(),
-		st::exportFileSizeLabel);
-	value() | rpl::map([](const Settings &data) {
-		return data.media.sizeLimit;
-	}) | rpl::on_next([=](int64 sizeLimit) {
-		const auto limit = sizeLimit / kMegabyte;
-		const auto size = QString::number(limit) + " MB";
-		const auto text = tr::lng_export_option_size_limit(
-			tr::now,
-			lt_size,
-			size);
-		label->setText(text);
-	}, slider->lifetime());
-
-	_sizeLimitExtraHeight = SizeLimitFitsOptionLine(
-		st::exportPanelSize.width(),
-		above->naturalWidth(),
-		label->width())
-		? 0
-		: label->height();
-
-	rpl::combine(
-		container->widthValue(),
-		label->widthValue(),
-		slider->geometryValue()
-	) | rpl::on_next([=](int outerWidth, int labelWidth, QRect geometry) {
-		const auto sameLine = SizeLimitFitsOptionLine(
-			outerWidth,
-			above->naturalWidth(),
-			labelWidth);
-		wrap->resize(wrap->width(), sameLine ? 0 : label->height());
-		label->moveToRight(
-			st::exportFileSizePadding.right(),
-			(sameLine
-				? (geometry.y()
-					- label->height()
-					- st::exportFileSizeLabelBottom)
-				: wrap->y()),
-			outerWidth);
-	}, label->lifetime());
+	wrap->toggleOn(above->checkedValue());
 }
 
 void SettingsWidget::refreshButtons(
