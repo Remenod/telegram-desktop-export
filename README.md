@@ -65,7 +65,10 @@ on top of upstream's release tags.
    `AUR_PUBLISH` is `true`; a manual run publishes when asked to.
 
 When a step fails, an issue *Build failed: <version>* is opened (or commented
-on), and the AUR packages stay at the previous version.
+on), and the AUR packages stay at the previous version. While that issue is
+open, the hourly check doesn't retry the version (no repeated failures and
+mail); a manual run with `force=true` or a newer Arch version builds again,
+and a successful build closes the issue.
 
 The repository allows local actions only, and `scripts/disable_upstream_workflows.py`
 keeps upstream's own workflows (carried by the release-based branches)

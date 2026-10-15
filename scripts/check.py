@@ -2,12 +2,17 @@
 """Decide whether a build is needed: has Arch Linux's extra/telegram-desktop
 got a version (pkgver-pkgrel) this repository has no release for yet?
 
+A version whose build failed (an open "Build failed: <version>" issue) is
+not retried every hour: that would only repeat the failure and the mail.
+It is built again by a manual run with force, or when Arch moves on.
+
 Prints GitHub step outputs: pkgver, pkgrel, build.
 """
 import argparse
 import json
 import os
 import subprocess
+import sys
 import urllib.request
 
 ARCH_JSON = "https://archlinux.org/packages/extra/x86_64/telegram-desktop/json/"
@@ -20,6 +25,15 @@ def release_exists(repo, tag):
     return result.returncode == 0
 
 
+def failure_open(repo, version):
+    title = f"Build failed: {version}"
+    found = json.loads(subprocess.run(
+        ["gh", "issue", "list", "--repo", repo, "--state", "open",
+         "--search", f'"{title}" in:title', "--json", "title"],
+        check=True, capture_output=True, text=True).stdout)
+    return any(issue["title"] == title for issue in found)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--force", default="false")
@@ -28,9 +42,19 @@ def main():
     with urllib.request.urlopen(ARCH_JSON, timeout=30) as response:
         info = json.load(response)
     pkgver, pkgrel = info["pkgver"], info["pkgrel"]
+    repo = os.environ["REPO"]
     tag = f"pkg-{pkgver}-{pkgrel}"
     force = args.force.lower() == "true"
-    build = force or not release_exists(os.environ["REPO"], tag)
+    if force:
+        build = True
+    elif release_exists(repo, tag):
+        build = False
+    elif failure_open(repo, f"{pkgver}-{pkgrel}"):
+        print(f"skipping {pkgver}-{pkgrel}: its build failed, see the issue",
+              file=sys.stderr)
+        build = False
+    else:
+        build = True
     print(f"pkgver={pkgver}")
     print(f"pkgrel={pkgrel}")
     print(f"build={'true' if build else 'false'}")

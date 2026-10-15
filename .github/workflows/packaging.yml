@@ -75,7 +75,7 @@ jobs:
             /opt/hostedtoolcache /usr/local/share/boost /usr/share/swift
           df -h /
       - name: Build in an Arch Linux container
-        run: docker run --rm -v "$PWD:/work" archlinux:base-devel bash /work/packaging/scripts/build.sh
+        run: docker run --rm -e PKGVER -e PKGREL -e REPO -v "$PWD:/work" archlinux:base-devel bash /work/packaging/scripts/build.sh
       - name: Make the GitHub release
         run: bash packaging/scripts/release.sh
       - name: Publish to the AUR
