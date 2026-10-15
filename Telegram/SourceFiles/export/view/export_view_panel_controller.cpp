@@ -175,6 +175,10 @@ void PanelController::createPanel() {
 	_panel = base::make_unique_q<Ui::SeparatePanel>(Ui::SeparatePanelArgs{
 		.onAllSpaces = true,
 	});
+
+	// A fixed window title lets compositor rules find this panel, e.g.
+	// to drop Hyprland's own border, shadow and blur around it.
+	_panel->setWindowTitle(u"Telegram Desktop Export"_q);
 	_panel->setTitle((singleTopic
 		? tr::lng_export_header_topic
 		: singlePeer
@@ -338,7 +342,12 @@ void PanelController::showProgress() {
 	}, progress->lifetime());
 
 	_panel->showInner(std::move(progress));
-	_panel->setHideOnDeactivate(true);
+
+	// Don't hide the progress panel when it loses focus: with focus
+	// following the mouse (e.g. Hyprland follow_mouse = 1) the panel
+	// would disappear as soon as the cursor crosses another window.
+	// It still hides by the close button or Escape, export goes on.
+	_panel->setHideOnDeactivate(false);
 }
 
 void PanelController::stopWithConfirmation(Fn<void()> callback) {
