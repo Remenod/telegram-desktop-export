@@ -123,6 +123,7 @@ public:
 
 private:
 	class LoadedFileCache;
+	class MediaReuse;
 	struct StartProcess;
 	struct ContactsProcess;
 	struct UserpicsProcess;
@@ -283,14 +284,28 @@ private:
 	bool writePreloadedFile(
 		Data::File &file,
 		const Data::FileOrigin &origin);
+	bool reusePreviousFile(
+		Data::File &file,
+		const Data::Message *message);
 	void loadFile(
 		const Data::File &file,
 		const Data::FileOrigin &origin,
 		Fn<bool(FileProgress)> progress,
 		FnMut<void(QString)> done);
 	void loadFilePart();
+	void filePartRequest(int64 offset);
 	void filePartDone(int64 offset, const MTPupload_File &result);
+	void filePartFail(int64 offset, const MTP::Error &error);
+	void filePartTemporaryFail(int64 offset, const QString &reason);
+	void filePartWatchStall(int64 offset);
+	void filePartStalled(
+		int64 offset,
+		uint64 randomId,
+		mtpRequestId requestId,
+		bool online);
+	void filePartGiveUp(const QString &reason);
 	void filePartUnavailable();
+	void callDelayed(crl::time delay, Fn<void()> callback);
 	[[nodiscard]] QString filePartMediaFolder() const;
 	void filePartRetryReference(
 		int64 offset,
@@ -331,6 +346,8 @@ private:
 	void ioError(const Output::Result &result);
 
 	MTP::ConcurrentSender _mtp;
+	base::weak_qptr<MTP::Instance> _instance;
+	Fn<void(FnMut<void()>)> _runner;
 	std::optional<uint64> _takeoutId;
 	std::optional<UserId> _selfId;
 	Output::Stats *_stats = nullptr;
@@ -340,6 +357,7 @@ private:
 
 	std::unique_ptr<StartProcess> _startProcess;
 	std::unique_ptr<LoadedFileCache> _fileCache;
+	std::unique_ptr<MediaReuse> _mediaReuse;
 	std::unique_ptr<ContactsProcess> _contactsProcess;
 	std::unique_ptr<UserpicsProcess> _userpicsProcess;
 	std::unique_ptr<StoriesProcess> _storiesProcess;

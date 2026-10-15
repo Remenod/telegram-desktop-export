@@ -85,7 +85,9 @@ private:
 		MediaType type);
 	void addSizeSlider(
 		not_null<Ui::VerticalLayout*> container,
-		not_null<Ui::Checkbox*> above);
+		not_null<Ui::Checkbox*> above,
+		MediaType type);
+	void addReuseMediaOption(not_null<Ui::VerticalLayout*> container);
 	void addLocationLabel(
 		not_null<Ui::VerticalLayout*> container);
 	void addFormatAndLocationLabel(
