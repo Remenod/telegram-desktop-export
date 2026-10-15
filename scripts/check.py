@@ -6,7 +6,10 @@ A version whose build failed (an open "Build failed: <version>" issue) is
 not retried every hour: that would only repeat the failure and the mail.
 It is built again by a manual run with force, or when Arch moves on.
 
-Prints GitHub step outputs: pkgver, pkgrel, build.
+With --republish the existing release is published to the AUR again
+without building (mode=republish).
+
+Prints GitHub step outputs: pkgver, pkgrel, build, mode.
 """
 import argparse
 import json
@@ -37,6 +40,7 @@ def failure_open(repo, version):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--force", default="false")
+    parser.add_argument("--republish", default="false")
     args = parser.parse_args()
 
     with urllib.request.urlopen(ARCH_JSON, timeout=30) as response:
@@ -45,7 +49,12 @@ def main():
     repo = os.environ["REPO"]
     tag = f"pkg-{pkgver}-{pkgrel}"
     force = args.force.lower() == "true"
-    if force:
+    mode = "build"
+    if args.republish.lower() == "true":
+        if not release_exists(repo, tag):
+            sys.exit(f"no release {tag} to publish again")
+        build, mode = True, "republish"
+    elif force:
         build = True
     elif release_exists(repo, tag):
         build = False
@@ -58,6 +67,7 @@ def main():
     print(f"pkgver={pkgver}")
     print(f"pkgrel={pkgrel}")
     print(f"build={'true' if build else 'false'}")
+    print(f"mode={mode}")
 
 
 if __name__ == "__main__":

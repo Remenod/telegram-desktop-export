@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Runs as root inside archlinux:base-devel with the workspace at /work.
-# Builds telegram-desktop-export with makepkg as an unprivileged user, then
-# writes .SRCINFO for it and the telegram-desktop-export-bin PKGBUILD made
-# from the built package.
+# Builds telegram-desktop-export with makepkg as an unprivileged user (unless
+# MODE=republish), then writes .SRCINFO for it and the
+# telegram-desktop-export-bin PKGBUILD made from the built package.
 set -euo pipefail
 out=/work/work/out
 
@@ -13,7 +13,10 @@ sed -i "s/^#\?MAKEFLAGS=.*/MAKEFLAGS=\"-j$(nproc)\"/" /etc/makepkg.conf
 chown -R builder: "$out"
 
 cd "$out/telegram-desktop-export"
-sudo -u builder makepkg --syncdeps --noconfirm --cleanbuild
+if [[ "${MODE:-build}" == build ]]; then
+  sudo -u builder makepkg --syncdeps --noconfirm --cleanbuild
+fi
+# With MODE=republish the package came from the existing release.
 sudo -u builder makepkg --printsrcinfo > .SRCINFO
 
 python3 /work/packaging/scripts/make_bin_pkgbuild.py "$out"

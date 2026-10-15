@@ -64,6 +64,10 @@ on top of upstream's release tags.
    `AUR_SSH_KEY`. Scheduled runs publish only when the repository variable
    `AUR_PUBLISH` is `true`; a manual run publishes when asked to.
 
+A manual run with `republish=true` pushes the existing release of the current
+Arch version to the AUR again without building (a few minutes), e.g. after a
+failed push.
+
 When a step fails, an issue *Build failed: <version>* is opened (or commented
 on), and the AUR packages stay at the previous version. While that issue is
 open, the hourly check doesn't retry the version (no repeated failures and
