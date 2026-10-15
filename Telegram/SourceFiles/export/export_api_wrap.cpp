@@ -11,12 +11,25 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "export/data/export_data_types.h"
 #include "export/output/export_output_result.h"
 #include "export/output/export_output_file.h"
+#include "export/output/export_output_stats.h"
 #include "mtproto/mtproto_response.h"
+#include "mtproto/facade.h"
 #include "base/bytes.h"
 #include "base/options.h"
 #include "base/random.h"
+#include <QtCore/QDir>
+#include <QtCore/QFile>
+#include <QtCore/QFileInfo>
+#include <QtCore/QJsonArray>
+#include <QtCore/QJsonDocument>
+#include <QtCore/QJsonObject>
+#include <QtCore/QTimer>
 #include <set>
 #include <deque>
+
+#ifdef Q_OS_UNIX
+#include <unistd.h>
+#endif // Q_OS_UNIX
 
 namespace Export {
 namespace {
@@ -25,6 +38,18 @@ constexpr auto kUserpicsSliceLimit = 100;
 constexpr auto kFileChunkSize = 128 * 1024;
 constexpr auto kFileRequestsCount = 2;
 //constexpr auto kFileNextRequestDelay = crl::time(20);
+
+// A file part that keeps failing with temporary errors (5xx, timeouts)
+// or doesn't answer at all is given up instead of being retried forever.
+constexpr auto kFileTemporaryErrorsLimit = 5;
+constexpr auto kFileRetryDelayMax = 16 * crl::time(1000);
+constexpr auto kFilePartTimeout = 45 * crl::time(1000);
+constexpr auto kFileStallsLimit = 2;
+constexpr auto kFileReferenceRefreshesLimit = 3;
+
+// Same shift as AdjustMigrateMessageIds applies in export_data_types.cpp.
+constexpr auto kMigratedMessagesIdShift = -1'000'000'000;
+
 constexpr auto kChatsSliceLimit = 100;
 constexpr auto kMessagesSliceLimit = 100;
 constexpr auto kTopPeerSliceLimit = 100;
@@ -33,6 +58,10 @@ constexpr auto kLocationCacheSize = 100'000;
 constexpr auto kMaxEmojiPerRequest = 100;
 constexpr auto kStoriesSliceLimit = 100;
 constexpr auto kProfileMusicSliceLimit = 100;
+
+[[nodiscard]] QString MediaIndexName() {
+	return u".media_index"_q;
+}
 
 struct LocationKey {
 	uint64 type;
@@ -426,6 +455,54 @@ private:
 
 };
 
+// Every export writes an index of the files it got into its own folder.
+// A new export reads the indexes of the exports next to it and takes
+// a file from the disk instead of downloading it again.
+//
+// Exports made without that index (by the official client) are read from
+// their result.json: there files are known only by the message they belong
+// to, so they are matched by chat, message id and file role.
+class ApiWrap::MediaReuse {
+public:
+	using Location = Data::FileLocation;
+
+	struct Previous {
+		QString path;
+		int64 size = 0;
+	};
+	struct OriginKey {
+		uint64 peer = 0;
+		int64 messageId = 0;
+		bool thumb = false;
+
+		friend inline auto operator<=>(
+			const OriginKey &,
+			const OriginKey &) = default;
+	};
+
+	MediaReuse(const QString &folder, bool usePrevious);
+
+	[[nodiscard]] const Previous *find(const Location &location) const;
+	[[nodiscard]] const Previous *find(const OriginKey &key) const;
+	void save(
+		const Location &location,
+		const QString &relativePath,
+		int64 size);
+
+private:
+	void loadPrevious();
+	void loadIndex(const QString &folder, const QString &indexPath);
+	void loadLegacyExport(const QString &folder);
+	[[nodiscard]] bool openIndex();
+
+	QString _folder;
+	QFile _index;
+	bool _indexFailed = false;
+	std::map<LocationKey, Previous> _previous;
+	std::map<OriginKey, Previous> _previousByOrigin;
+
+};
+
 struct ApiWrap::StartProcess {
 	FnMut<void(StartInfo)> done;
 
@@ -515,6 +592,12 @@ struct ApiWrap::FileProcess {
 	};
 	std::deque<Request> requests;
 	mtpRequestId requestId = 0;
+
+	// Reset on every received part.
+	int temporaryErrors = 0;
+	int stalls = 0;
+	int referenceRefreshes = 0;
+	uint64 retrySerial = 0;
 };
 
 struct ApiWrap::FileProgress {
@@ -705,6 +788,219 @@ std::optional<QString> ApiWrap::LoadedFileCache::find(
 	return std::nullopt;
 }
 
+ApiWrap::MediaReuse::MediaReuse(const QString &folder, bool usePrevious)
+: _folder(folder)
+, _index(folder + MediaIndexName()) {
+	if (usePrevious) {
+		loadPrevious();
+	}
+}
+
+void ApiWrap::MediaReuse::loadPrevious() {
+	// The export goes either right into the chosen folder or into
+	// a DataExport_* / ChatExport_* subfolder of it, so look at the
+	// parent folder and at all the folders next to ours.
+	const auto current = QDir(_folder).absolutePath();
+	auto parent = QDir(_folder);
+	if (!parent.cdUp()) {
+		return;
+	}
+	auto candidates = std::vector<QFileInfo>();
+	const auto check = [&](const QString &folder) {
+		if (QDir(folder).absolutePath() == current) {
+			return;
+		}
+		const auto index = QFileInfo(folder + '/' + MediaIndexName());
+		const auto legacy = QFileInfo(folder + u"/result.json"_q);
+		if (index.isFile()) {
+			candidates.push_back(index);
+		} else if (legacy.isFile()) {
+			candidates.push_back(legacy);
+		}
+	};
+	check(parent.absolutePath());
+	const auto folders = parent.entryInfoList(
+		QDir::Dirs | QDir::NoDotAndDotDot);
+	for (const auto &folder : folders) {
+		check(folder.absoluteFilePath());
+	}
+
+	// The newest export wins when several have the same file.
+	ranges::sort(candidates, [](const QFileInfo &a, const QFileInfo &b) {
+		return a.lastModified() > b.lastModified();
+	});
+	for (const auto &info : candidates) {
+		const auto folder = info.absolutePath() + '/';
+		if (info.fileName() == MediaIndexName()) {
+			loadIndex(folder, info.absoluteFilePath());
+		} else {
+			loadLegacyExport(folder);
+		}
+	}
+	LOG(("Export Info: %1 files by location and %2 by message known "
+		"from %3 previous exports."
+		).arg(_previous.size()
+		).arg(_previousByOrigin.size()
+		).arg(candidates.size()));
+}
+
+void ApiWrap::MediaReuse::loadLegacyExport(const QString &folder) {
+	auto file = QFile(folder + u"result.json"_q);
+	if (!file.open(QIODevice::ReadOnly)) {
+		return;
+	}
+	auto error = QJsonParseError();
+	const auto document = QJsonDocument::fromJson(file.readAll(), &error);
+	if (error.error != QJsonParseError::NoError || !document.isObject()) {
+		LOG(("Export Error: Could not parse '%1': %2."
+			).arg(file.fileName()
+			).arg(error.errorString()));
+		return;
+	}
+	const auto peerByType = [](const QString &type, int64 bareId) {
+		const auto bare = BareId(bareId);
+		if (type == u"private_group"_q) {
+			return peerFromChat(ChatId(bare));
+		} else if (type.endsWith(u"_supergroup"_q)
+			|| type.endsWith(u"_channel"_q)) {
+			return peerFromChannel(ChannelId(bare));
+		}
+		return peerFromUser(UserId(bare));
+	};
+	const auto parseChat = [&](const QJsonObject &chat) {
+		const auto peer = peerByType(
+			chat.value(u"type"_q).toString(),
+			chat.value(u"id"_q).toInteger());
+		const auto messages = chat.value(u"messages"_q).toArray();
+		for (const auto &value : messages) {
+			const auto message = value.toObject();
+			const auto id = message.value(u"id"_q).toInteger();
+			const auto add = [&](
+					const QString &pathKey,
+					const QString &sizeKey,
+					bool thumb) {
+				const auto path = message.value(pathKey).toString();
+
+				// Skipped files have a "(File not included...)" text.
+				if (path.isEmpty() || path.startsWith('(')) {
+					return;
+				}
+				_previousByOrigin.emplace(
+					OriginKey{ peer.value, id, thumb },
+					Previous{
+						folder + path,
+						message.value(sizeKey).toInteger(),
+					});
+			};
+			add(u"photo"_q, u"photo_file_size"_q, false);
+			add(u"file"_q, u"file_size"_q, false);
+			add(u"thumbnail"_q, u"thumbnail_file_size"_q, true);
+		}
+	};
+	const auto root = document.object();
+	if (root.contains(u"messages"_q)) {
+		// A single chat export.
+		parseChat(root);
+	}
+	for (const auto &key : { u"chats"_q, u"left_chats"_q }) {
+		const auto list = root.value(key).toObject().value(u"list"_q);
+		for (const auto &chat : list.toArray()) {
+			parseChat(chat.toObject());
+		}
+	}
+}
+
+void ApiWrap::MediaReuse::loadIndex(
+		const QString &folder,
+		const QString &indexPath) {
+	auto file = QFile(indexPath);
+	if (!file.open(QIODevice::ReadOnly)) {
+		return;
+	}
+	while (!file.atEnd()) {
+		auto bytes = file.readLine();
+		if (bytes.endsWith('\n')) {
+			bytes.chop(1);
+		}
+		if (bytes.isEmpty() || bytes.startsWith('#')) {
+			continue;
+		}
+		const auto parts = QString::fromUtf8(bytes).split('\t');
+		if (parts.size() != 4) {
+			continue;
+		}
+		auto typeOk = false, idOk = false, sizeOk = false;
+		const auto key = LocationKey{
+			parts[0].toULongLong(&typeOk, 16),
+			parts[1].toULongLong(&idOk, 16),
+		};
+		const auto size = parts[2].toLongLong(&sizeOk);
+		if (!typeOk || !idOk || !sizeOk || parts[3].isEmpty()) {
+			continue;
+		}
+		_previous.emplace(key, Previous{ folder + parts[3], size });
+	}
+}
+
+auto ApiWrap::MediaReuse::find(const Location &location) const
+-> const Previous* {
+	if (!location) {
+		return nullptr;
+	}
+	const auto i = _previous.find(ComputeLocationKey(location));
+	return (i != end(_previous)) ? &i->second : nullptr;
+}
+
+auto ApiWrap::MediaReuse::find(const OriginKey &key) const
+-> const Previous* {
+	const auto i = _previousByOrigin.find(key);
+	return (i != end(_previousByOrigin)) ? &i->second : nullptr;
+}
+
+bool ApiWrap::MediaReuse::openIndex() {
+	if (_index.isOpen()) {
+		return true;
+	} else if (_indexFailed) {
+		return false;
+	}
+	const auto exists = _index.exists();
+	QDir().mkpath(_folder);
+	if (!_index.open(QIODevice::Append)) {
+		LOG(("Export Error: Could not open media index '%1'."
+			).arg(_index.fileName()));
+		_indexFailed = true;
+		return false;
+	}
+	if (!exists) {
+		_index.write("# Telegram Desktop export media index v1\n"
+			"# location type, location id, size, relative path\n");
+	}
+	return true;
+}
+
+void ApiWrap::MediaReuse::save(
+		const Location &location,
+		const QString &relativePath,
+		int64 size) {
+	if (!location
+		|| relativePath.isEmpty()
+		|| relativePath.contains('\n')
+		|| relativePath.contains('\t')
+		|| !openIndex()) {
+		return;
+	}
+	const auto key = ComputeLocationKey(location);
+	const auto line = QString::number(key.type, 16)
+		+ '\t' + QString::number(key.id, 16)
+		+ '\t' + QString::number(size)
+		+ '\t' + relativePath
+		+ '\n';
+
+	// Written right away, so that an interrupted export is reusable too.
+	_index.write(line.toUtf8());
+	_index.flush();
+}
+
 ApiWrap::FileProcess::FileProcess(const QString &path, Output::Stats *stats)
 : file(path, stats) {
 }
@@ -750,31 +1046,17 @@ auto ApiWrap::fileRequest(const Data::FileLocation &location, int64 offset) {
 			MTP_int(kFileChunkSize))
 	)).fail([=](const MTP::Error &result) {
 		_fileProcess->requestId = 0;
-		if (result.type() == u"TAKEOUT_FILE_EMPTY"_q
-			&& _otherDataProcess != nullptr) {
-			filePartDone(
-				0,
-				MTP_upload_file(
-					MTP_storage_filePartial(),
-					MTP_int(0),
-					MTP_bytes()));
-		} else if (result.type() == u"LOCATION_INVALID"_q
-			|| result.type() == u"VERSION_INVALID"_q
-			|| result.type() == u"LOCATION_NOT_AVAILABLE"_q) {
-			filePartUnavailable();
-		} else if (result.code() == 400
-			&& result.type().startsWith(u"FILE_REFERENCE_"_q)) {
-			filePartRefreshReference(offset);
-		} else {
-			error(std::move(result));
-		}
-	}).toDC(MTP::ShiftDcId(location.dcId, MTP::kExportMediaDcShift)));
+		filePartFail(offset, result);
+	}).handleAllErrors(
+	).toDC(MTP::ShiftDcId(location.dcId, MTP::kExportMediaDcShift)));
 }
 
 ApiWrap::ApiWrap(
 	base::weak_qptr<MTP::Instance> weak,
 	Fn<void(FnMut<void()>)> runner)
-: _mtp(weak, std::move(runner))
+: _mtp(weak, runner)
+, _instance(weak)
+, _runner(std::move(runner))
 , _fileCache(std::make_unique<LoadedFileCache>(kLocationCacheSize)) {
 }
 
@@ -795,6 +1077,9 @@ void ApiWrap::startExport(
 
 	_settings = std::make_unique<Settings>(settings);
 	_stats = stats;
+	_mediaReuse = std::make_unique<MediaReuse>(
+		_settings->path,
+		_settings->reusePreviousMedia);
 	_startProcess = std::make_unique<StartProcess>();
 	_startProcess->done = std::move(done);
 
@@ -1052,8 +1337,14 @@ void ApiWrap::requestDialogsList(
 
 void ApiWrap::startMainSession(FnMut<void()> done) {
 	using Type = Settings::Type;
-	const auto sizeLimit = _settings->media.sizeLimit;
-	const auto hasFiles = ((_settings->media.types != 0) && (sizeLimit > 0))
+
+	// The takeout limit must let through the largest per-type limit,
+	// each type is filtered by its own limit in processFileLoad.
+	const auto mediaSizeLimit = _settings->media.maxSizeLimit();
+	const auto sizeLimit = std::max(
+		mediaSizeLimit,
+		_settings->media.sizeLimit);
+	const auto hasFiles = (mediaSizeLimit > 0)
 		|| (_settings->types & Type::Userpics)
 		|| (_settings->types & Type::Stories);
 
@@ -1885,8 +2176,11 @@ void ApiWrap::skipFile(uint64 randomId) {
 	}
 	LOG(("Export Info: File skipped."));
 	Assert(!_fileProcess->requests.empty());
-	Assert(_fileProcess->requestId != 0);
-	_mtp.request(base::take(_fileProcess->requestId)).cancel();
+
+	// No request is in flight while a retry of a failed part is pending.
+	if (_fileProcess->requestId) {
+		_mtp.request(base::take(_fileProcess->requestId)).cancel();
+	}
 	base::take(_fileProcess)->done(QString());
 }
 
@@ -3275,11 +3569,14 @@ bool ApiWrap::processFileLoad(
 	} else if ((_settings->media.types & policy.type) != policy.type) {
 		file.skipReason = SkipReason::FileType;
 		return true;
-	} else if (policy.controllingSize > _settings->media.sizeLimit) {
+	} else if (policy.controllingSize
+		> _settings->media.sizeLimitFor(policy.type)) {
 		file.skipReason = SkipReason::FileSize;
 		return true;
 	} else if (writePreloadedFile(file, origin)) {
 		return !file.relativePath.isEmpty();
+	} else if (reusePreviousFile(file, policy.message)) {
+		return true;
 	}
 	loadFile(file, origin, std::move(progress), std::move(done));
 	return false;
@@ -3324,9 +3621,11 @@ bool ApiWrap::processFileLoad(
 	} else if (!story && (_settings->media.types & type) != type) {
 		file.skipReason = SkipReason::FileType;
 		return true;
-	} else if (!story && fullSize > _settings->media.sizeLimit) {
+	} else if (!story && fullSize > _settings->media.sizeLimitFor(type)) {
 		// Don't load thumbs for large files that we skip.
 		file.skipReason = SkipReason::FileSize;
+		return true;
+	} else if (reusePreviousFile(file, message)) {
 		return true;
 	}
 	loadFile(file, origin, std::move(progress), std::move(done));
@@ -3354,6 +3653,82 @@ bool ApiWrap::writePreloadedFile(
 		return true;
 	}
 	return false;
+}
+
+bool ApiWrap::reusePreviousFile(
+		Data::File &file,
+		const Data::Message *message) {
+	Expects(_settings != nullptr);
+	Expects(_mediaReuse != nullptr);
+
+	auto previous = _mediaReuse->find(file.location);
+	const auto byLocation = (previous != nullptr);
+	if (!previous
+		&& message
+		&& _chatProcess
+		&& _chatProcess->localSplitIndex < _chatProcess->info.splits.size()) {
+		// Old exports without an index know files only by message.
+		const auto thumb = (&file == &message->thumb().file);
+		if (thumb || &file == &message->file()) {
+			const auto &info = _chatProcess->info;
+			const auto split = info.splits[_chatProcess->localSplitIndex];
+
+			// Messages of a group migrated to a supergroup get their ids
+			// shifted the same way in the written export.
+			const auto shift = (split < 0) ? kMigratedMessagesIdShift : 0;
+			previous = _mediaReuse->find(MediaReuse::OriginKey{
+				.peer = info.peerId.value,
+				.messageId = int64(message->id) + shift,
+				.thumb = thumb,
+			});
+		}
+	}
+	if (!previous) {
+		return false;
+	}
+	const auto info = QFileInfo(previous->path);
+	const auto size = info.size();
+	if (!info.isFile()
+		|| (previous->size > 0 && size != previous->size)
+		|| (file.size > 0 && size != file.size)
+		|| (!byLocation && file.size <= 0)) {
+		// A match by message alone is trusted only with a known size.
+		return false;
+	}
+	const auto relativePath = Output::File::PrepareRelativePath(
+		_settings->path,
+		file.suggestedPath);
+	const auto target = _settings->path + relativePath;
+	QDir().mkpath(QFileInfo(target).absolutePath());
+
+	// A hard link costs no space and survives removal of the old export,
+	// a copy is the fallback for another disk or a file system without
+	// hard links.
+	auto linked = false;
+#ifdef Q_OS_UNIX
+	linked = !::link(
+		QFile::encodeName(previous->path).constData(),
+		QFile::encodeName(target).constData());
+#endif // Q_OS_UNIX
+	if (!linked && !QFile::copy(previous->path, target)) {
+		LOG(("Export Error: Could not reuse '%1' as '%2'."
+			).arg(previous->path
+			).arg(target));
+		QFile::remove(target);
+		return false;
+	}
+	file.relativePath = relativePath;
+	_fileCache->save(file.location, relativePath);
+	_mediaReuse->save(file.location, relativePath, size);
+	if (_stats) {
+		_stats->incrementFiles();
+		for (auto left = size; left > 0;) {
+			const auto part = std::min(left, int64(1024 * 1024 * 1024));
+			_stats->incrementBytes(int(part));
+			left -= part;
+		}
+	}
+	return true;
 }
 
 void ApiWrap::loadFile(
@@ -3415,14 +3790,8 @@ void ApiWrap::loadFilePart() {
 
 	const auto offset = _fileProcess->offset;
 	_fileProcess->requests.push_back({ offset });
-	_fileProcess->requestId = fileRequest(
-		_fileProcess->location,
-		_fileProcess->offset
-	).done([=](const MTPupload_File &result) {
-		_fileProcess->requestId = 0;
-		filePartDone(offset, result);
-	}).send();
 	_fileProcess->offset += kFileChunkSize;
+	filePartRequest(offset);
 
 	if (_fileProcess->size > 0
 		&& _fileProcess->requests.size() < kFileRequestsCount) {
@@ -3438,18 +3807,196 @@ void ApiWrap::loadFilePart() {
 	}
 }
 
+void ApiWrap::filePartRequest(int64 offset) {
+	Expects(_fileProcess != nullptr);
+	Expects(_fileProcess->requestId == 0);
+
+	_fileProcess->requestId = fileRequest(
+		_fileProcess->location,
+		offset
+	).done([=](const MTPupload_File &result) {
+		_fileProcess->requestId = 0;
+		filePartDone(offset, result);
+	}).send();
+	filePartWatchStall(offset);
+}
+
+void ApiWrap::filePartFail(int64 offset, const MTP::Error &result) {
+	Expects(_fileProcess != nullptr);
+	Expects(_fileProcess->requestId == 0);
+
+	const auto &type = result.type();
+	if (type == u"TAKEOUT_FILE_EMPTY"_q && _otherDataProcess != nullptr) {
+		filePartDone(
+			0,
+			MTP_upload_file(
+				MTP_storage_filePartial(),
+				MTP_int(0),
+				MTP_bytes()));
+	} else if (type == u"LOCATION_INVALID"_q
+		|| type == u"VERSION_INVALID"_q
+		|| type == u"LOCATION_NOT_AVAILABLE"_q) {
+		filePartUnavailable();
+	} else if (result.code() == 400
+		&& type.startsWith(u"FILE_REFERENCE_"_q)) {
+		filePartRefreshReference(offset);
+	} else if (MTP::IsFloodError(result)) {
+		// Flood waits are expected during a long export, honor them.
+		const auto seconds = type.mid(type.lastIndexOf('_') + 1).toInt();
+		const auto delay = std::max(seconds, 1) * crl::time(1000);
+		LOG(("Export Info: File part flood wait %1s.").arg(seconds));
+		const auto randomId = _fileProcess->randomId;
+		const auto serial = ++_fileProcess->retrySerial;
+		callDelayed(delay, [=] {
+			if (_fileProcess
+				&& _fileProcess->randomId == randomId
+				&& _fileProcess->retrySerial == serial
+				&& !_fileProcess->requestId) {
+				filePartRequest(offset);
+			}
+		});
+	} else if (MTP::IsTemporaryError(result)) {
+		filePartTemporaryFail(
+			offset,
+			QString::number(result.code()) + ' ' + type);
+	} else if (type.startsWith(u"TAKEOUT_"_q)) {
+		// The takeout session itself is broken, the export can't go on.
+		error(result);
+	} else {
+		// Any other error concerns only this file, not the whole export.
+		filePartGiveUp(QString::number(result.code()) + ' ' + type);
+	}
+}
+
+void ApiWrap::filePartTemporaryFail(int64 offset, const QString &reason) {
+	Expects(_fileProcess != nullptr);
+	Expects(_fileProcess->requestId == 0);
+
+	const auto attempt = ++_fileProcess->temporaryErrors;
+	if (attempt > kFileTemporaryErrorsLimit) {
+		filePartGiveUp(u"%1 temporary errors, last: %2"_q
+			.arg(attempt - 1)
+			.arg(reason));
+		return;
+	}
+	const auto delay = std::min(
+		crl::time(1000) << (attempt - 1),
+		kFileRetryDelayMax);
+	LOG(("Export Info: File part failed (%1), retry %2 of %3 in %4ms."
+		).arg(reason
+		).arg(attempt
+		).arg(kFileTemporaryErrorsLimit
+		).arg(delay));
+	const auto randomId = _fileProcess->randomId;
+	const auto serial = ++_fileProcess->retrySerial;
+	callDelayed(delay, [=] {
+		if (_fileProcess
+			&& _fileProcess->randomId == randomId
+			&& _fileProcess->retrySerial == serial
+			&& !_fileProcess->requestId) {
+			filePartRequest(offset);
+		}
+	});
+}
+
+void ApiWrap::filePartWatchStall(int64 offset) {
+	Expects(_fileProcess != nullptr);
+	Expects(_fileProcess->requestId != 0);
+
+	// The MTP layer may keep a request waiting without ever failing it.
+	// The connection state is read on the main thread, where MTP lives.
+	const auto randomId = _fileProcess->randomId;
+	const auto requestId = _fileProcess->requestId;
+	crl::on_main([=, instance = _instance, runner = _runner] {
+		QTimer::singleShot(int(kFilePartTimeout), [=] {
+			const auto strong = instance.get();
+			const auto online = strong
+				&& (strong->dcstate() == MTP::ConnectedState);
+			runner([=] {
+				filePartStalled(offset, randomId, requestId, online);
+			});
+		});
+	});
+}
+
+void ApiWrap::filePartStalled(
+		int64 offset,
+		uint64 randomId,
+		mtpRequestId requestId,
+		bool online) {
+	if (!_fileProcess
+		|| _fileProcess->randomId != randomId
+		|| _fileProcess->requestId != requestId) {
+		return;
+	}
+	if (!online) {
+		// No connection at all is not a problem of this file: keep the
+		// request, MTP sends it again once the connection is back.
+		LOG(("Export Info: No connection, still waiting for a file part."));
+		filePartWatchStall(offset);
+		return;
+	}
+	_mtp.request(base::take(_fileProcess->requestId)).cancel();
+	if (++_fileProcess->stalls >= kFileStallsLimit) {
+		filePartGiveUp(u"no answer for a file part %1 times in a row"_q
+			.arg(_fileProcess->stalls));
+	} else {
+		LOG(("Export Info: File part got no answer in %1s, retrying."
+			).arg(kFilePartTimeout / 1000));
+		filePartRequest(offset);
+	}
+}
+
+void ApiWrap::filePartGiveUp(const QString &reason) {
+	Expects(_fileProcess != nullptr);
+	Expects(_settings != nullptr);
+
+	LOG(("Export Error: Giving up on file '%1': %2."
+		).arg(_fileProcess->relativePath
+		).arg(reason));
+
+	// Don't leave a truncated file in the export folder.
+	if (!_fileProcess->relativePath.isEmpty()) {
+		QFile::remove(_settings->path + _fileProcess->relativePath);
+	}
+
+	// Make the holes visible in the export itself, not only in the log.
+	auto list = QFile(_settings->path + u"skipped_files.txt"_q);
+	if (list.open(QIODevice::Append)) {
+		list.write((_fileProcess->relativePath
+			+ '\t'
+			+ reason
+			+ '\n').toUtf8());
+	}
+	filePartUnavailable();
+}
+
+void ApiWrap::callDelayed(crl::time delay, Fn<void()> callback) {
+	// ApiWrap lives on a crl queue without an event loop, so the timer
+	// runs on the main thread and the callback goes back to the queue.
+	crl::on_main([=, runner = _runner] {
+		QTimer::singleShot(int(delay), [=] {
+			runner(callback);
+		});
+	});
+}
+
 void ApiWrap::filePartDone(int64 offset, const MTPupload_File &result) {
 	Expects(_fileProcess != nullptr);
 	Expects(!_fileProcess->requests.empty());
 
+	_fileProcess->temporaryErrors = 0;
+	_fileProcess->stalls = 0;
+	_fileProcess->referenceRefreshes = 0;
 	if (result.type() == mtpc_upload_fileCdnRedirect) {
-		error("Cdn redirect is not supported.");
+		filePartGiveUp(u"CDN redirect is not supported"_q);
 		return;
 	}
 	const auto &data = result.c_upload_file();
 	if (data.vbytes().v.isEmpty()) {
 		if (_fileProcess->size > 0) {
-			error("Empty bytes received in file part.");
+			// The server has less data than the file size says.
+			filePartGiveUp(u"empty bytes received in file part"_q);
 			return;
 		}
 		const auto result = _fileProcess->file.writeBlock({});
@@ -3495,6 +4042,7 @@ void ApiWrap::filePartDone(int64 offset, const MTPupload_File &result) {
 	auto process = base::take(_fileProcess);
 	const auto relativePath = process->relativePath;
 	_fileCache->save(process->location, relativePath);
+	_mediaReuse->save(process->location, relativePath, process->file.size());
 	process->done(process->relativePath);
 }
 
@@ -3514,19 +4062,18 @@ void ApiWrap::filePartRetryReference(
 	Expects(_fileProcess->requestId == 0);
 
 	_fileProcess->location = std::move(location);
-	_fileProcess->requestId = fileRequest(
-		_fileProcess->location,
-		offset
-	).done([=](const MTPupload_File &result) {
-		_fileProcess->requestId = 0;
-		filePartDone(offset, result);
-	}).send();
+	filePartRequest(offset);
 }
 
 void ApiWrap::filePartRefreshReference(int64 offset) {
 	Expects(_fileProcess != nullptr);
 	Expects(_fileProcess->requestId == 0);
 
+	// A reference the server keeps rejecting must not loop forever.
+	if (++_fileProcess->referenceRefreshes > kFileReferenceRefreshesLimit) {
+		filePartGiveUp(u"file reference keeps expiring"_q);
+		return;
+	}
 	const auto origin = _fileProcess->origin;
 	if (origin.storyId) {
 		_fileProcess->requestId = mainRequest(MTPstories_GetStoriesByID(
@@ -3587,7 +4134,7 @@ void ApiWrap::filePartRefreshReference(int64 offset) {
 		return;
 	}
 	if (!origin.messageId) {
-		error("FILE_REFERENCE error for non-message file.");
+		filePartGiveUp(u"FILE_REFERENCE error for non-message file"_q);
 		return;
 	}
 	if (origin.peer.type() == mtpc_inputPeerChannel

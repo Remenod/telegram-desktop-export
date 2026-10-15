@@ -34,11 +34,29 @@ struct MediaSettings {
 	friend inline constexpr auto is_flag_type(Type) { return true; };
 
 	Types types = DefaultTypes();
+
+	// Limit for the types that don't have their own one in sizeLimits.
 	int64 sizeLimit = 8 * 1024 * 1024;
+	base::flat_map<Type, int64> sizeLimits;
+
+	[[nodiscard]] int64 sizeLimitFor(Type type) const;
+	void setSizeLimit(Type type, int64 limit);
+
+	// The largest limit among the enabled types, 0 if none is enabled.
+	[[nodiscard]] int64 maxSizeLimit() const;
 
 	static inline Types DefaultTypes() {
 		return Type::Photo;
 	}
+	static inline constexpr Type kAllTypes[] = {
+		Type::Photo,
+		Type::Video,
+		Type::VoiceMessage,
+		Type::VideoMessage,
+		Type::Sticker,
+		Type::GIF,
+		Type::File,
+	};
 
 };
 
@@ -83,6 +101,10 @@ struct Settings {
 	Types types = DefaultTypes();
 	Types fullChats = DefaultFullChats();
 	MediaSettings media;
+
+	// Take files already downloaded by earlier exports in the same base
+	// folder from the disk instead of downloading them again.
+	bool reusePreviousMedia = true;
 
 	MTPInputPeer singlePeer = MTP_inputPeerEmpty();
 	TimeId singlePeerFrom = 0;
