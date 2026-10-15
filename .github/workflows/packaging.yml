@@ -47,6 +47,7 @@ jobs:
       mode: ${{ steps.check.outputs.mode }}
       pkgver: ${{ steps.check.outputs.pkgver }}
       pkgrel: ${{ steps.check.outputs.pkgrel }}
+      arch_pkgrel: ${{ steps.check.outputs.arch_pkgrel }}
     steps:
       - name: Get the packaging scripts
         run: git clone --quiet --depth 1 --branch "${{ github.ref_name }}" "https://github.com/${REPO}.git" packaging
@@ -71,6 +72,7 @@ jobs:
     env:
       PKGVER: ${{ needs.check.outputs.pkgver }}
       PKGREL: ${{ needs.check.outputs.pkgrel }}
+      ARCH_PKGREL: ${{ needs.check.outputs.arch_pkgrel }}
       MODE: ${{ needs.check.outputs.mode }}
     steps:
       - name: Get the packaging scripts

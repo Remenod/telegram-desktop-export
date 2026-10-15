@@ -72,13 +72,15 @@ def append_to_array(text, name, item):
 
 def main():
     pkgver, pkgrel = os.environ["PKGVER"], os.environ["PKGREL"]
+    # Our pkgrel may be a sub-release ("1.1") of Arch's ("1").
+    arch_pkgrel = os.environ.get("ARCH_PKGREL") or pkgrel
     repo_url = REPO_URL.format(repo=os.environ["REPO"])
     out = os.path.join("work", "out", NAME)
     arch = os.path.join("work", "arch")
     shutil.rmtree(arch, ignore_errors=True)
     subprocess.run(["git", "-c", "advice.detachedHead=false", "clone",
                     "--quiet", "--depth", "1", "--branch",
-                    f"{pkgver}-{pkgrel}", ARCH_GIT, arch], check=True)
+                    f"{pkgver}-{arch_pkgrel}", ARCH_GIT, arch], check=True)
     with open(os.path.join(arch, "PKGBUILD")) as f:
         text = f.read()
 
@@ -89,7 +91,8 @@ def main():
     header = "\n".join([
         "# Maintainer: Remenod <remenod@gmail.com>",
         *credits,
-        f"# Generated from Arch Linux's extra/telegram-desktop {pkgver}-{pkgrel}",
+        "# Generated from Arch Linux's extra/telegram-desktop "
+        f"{pkgver}-{arch_pkgrel}",
         f"# by {repo_url} (packaging branch).",
     ]) + "\n\n"
     text = header + body.lstrip("\n")
@@ -97,6 +100,10 @@ def main():
     if not re.search(r"^pkgname=telegram-desktop$", text, re.M):
         fail("pkgname isn't telegram-desktop")
     text = re.sub(r"^pkgname=.*$", f"pkgname={NAME}", text, count=1,
+                  flags=re.M)
+    if not re.search(rf"^pkgrel={re.escape(arch_pkgrel)}$", text, re.M):
+        fail(f"pkgrel isn't {arch_pkgrel}")
+    text = re.sub(r"^pkgrel=.*$", f"pkgrel={pkgrel}", text, count=1,
                   flags=re.M)
     text = re.sub(r"^pkgdesc=.*$", f"pkgdesc='{DESCRIPTION}'", text,
                   count=1, flags=re.M)
@@ -142,6 +149,17 @@ def main():
             fail("no build()")
         text = (text[:build.start()] + "prepare() {\n" + apply + "}\n\n"
                 + text[build.start():])
+
+    # Arch installs the binary as /usr/bin/Telegram, telegram-desktop-bin
+    # as /usr/bin/telegram-desktop: offer both, so that scripts and
+    # autostart entries of either keep working.
+    package = re.search(r"^package\(\) \{\n.*?^\}", text, re.M | re.S)
+    if not package:
+        fail("no package()")
+    link = ('  [[ -e "$pkgdir/usr/bin/telegram-desktop" ]] \\\n'
+            '    || ln -s Telegram "$pkgdir/usr/bin/telegram-desktop"\n')
+    end = package.end() - 1
+    text = text[:end] + link + text[end:]
 
     shutil.rmtree(out, ignore_errors=True)
     os.makedirs(out)

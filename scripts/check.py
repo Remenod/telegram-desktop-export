@@ -9,7 +9,11 @@ It is built again by a manual run with force, or when Arch moves on.
 With --republish the existing release is published to the AUR again
 without building (mode=republish).
 
-Prints GitHub step outputs: pkgver, pkgrel, build, mode.
+A change of the packaging itself, on the same Arch version, is released as
+a sub-release: the file subrel next to this script's folder lists
+"<arch pkgver>-<arch pkgrel> <n>" lines, making our pkgrel "<pkgrel>.<n>".
+
+Prints GitHub step outputs: pkgver, pkgrel (ours), arch_pkgrel, build, mode.
 """
 import argparse
 import json
@@ -37,6 +41,19 @@ def failure_open(repo, version):
     return any(issue["title"] == title for issue in found)
 
 
+def subrelease(version):
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..",
+                        "subrel")
+    if not os.path.exists(path):
+        return None
+    with open(path) as f:
+        for line in f:
+            parts = line.split("#", 1)[0].split()
+            if len(parts) == 2 and parts[0] == version:
+                return parts[1]
+    return None
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--force", default="false")
@@ -45,7 +62,9 @@ def main():
 
     with urllib.request.urlopen(ARCH_JSON, timeout=30) as response:
         info = json.load(response)
-    pkgver, pkgrel = info["pkgver"], info["pkgrel"]
+    pkgver, arch_pkgrel = info["pkgver"], info["pkgrel"]
+    sub = subrelease(f"{pkgver}-{arch_pkgrel}")
+    pkgrel = f"{arch_pkgrel}.{sub}" if sub else arch_pkgrel
     repo = os.environ["REPO"]
     tag = f"pkg-{pkgver}-{pkgrel}"
     force = args.force.lower() == "true"
@@ -66,6 +85,7 @@ def main():
         build = True
     print(f"pkgver={pkgver}")
     print(f"pkgrel={pkgrel}")
+    print(f"arch_pkgrel={arch_pkgrel}")
     print(f"build={'true' if build else 'false'}")
     print(f"mode={mode}")
 

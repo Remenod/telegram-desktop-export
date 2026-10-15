@@ -68,6 +68,15 @@ A manual run with `republish=true` pushes the existing release of the current
 Arch version to the AUR again without building (a few minutes), e.g. after a
 failed push.
 
+A change of the packaging itself on the same Arch version goes out as a
+sub-release: a line `<arch pkgver>-<arch pkgrel> <n>` in `subrel` makes our
+pkgrel `<arch pkgrel>.<n>` (the next hourly check builds it). Once Arch moves
+to a new version the line no longer matches and is just history.
+
+Besides Arch's `/usr/bin/Telegram`, the package has `/usr/bin/telegram-desktop`
+(the name `telegram-desktop-bin` uses), so autostart entries and scripts of
+either keep working.
+
 When a step fails, an issue *Build failed: <version>* is opened (or commented
 on), and the AUR packages stay at the previous version. While that issue is
 open, the hourly check doesn't retry the version (no repeated failures and
