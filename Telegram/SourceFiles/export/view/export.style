@@ -27,6 +27,8 @@ exportFileSizeLabel: LabelSimple(defaultLabelSimple) {
 }
 exportFileSizePadding: margins(22px, 8px, 22px, 8px);
 exportFileSizeLabelBottom: 18px;
+exportTypeSizeLabelPadding: margins(56px, 0px, 22px, 0px);
+exportTypeSizeSliderPadding: margins(56px, 8px, 22px, 12px);
 
 exportLocationLabel: FlatLabel(boxLabel) {
 	maxHeight: 21px;

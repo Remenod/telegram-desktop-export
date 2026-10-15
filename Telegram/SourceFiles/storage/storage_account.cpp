@@ -66,6 +66,12 @@ constexpr auto kSinglePeerTypeChat = qint32(8 + 2);
 constexpr auto kSinglePeerTypeChannel = qint32(8 + 3);
 constexpr auto kSinglePeerTypeSelf = qint32(4);
 constexpr auto kSinglePeerTypeEmpty = qint32(0);
+
+// Marks the export settings block added by the export patches.
+constexpr auto kExportPatchMagic = quint32(0x45585054); // 'EXPT'
+constexpr auto kExportPatchVersion = quint32(1);
+constexpr auto kExportPatchSizeLimitsMax = quint32(64);
+
 constexpr auto kMultiDraftTagOld = quint64(0xFFFF'FFFF'FFFF'FF01ULL);
 constexpr auto kMultiDraftCursorsTagOld = quint64(0xFFFF'FFFF'FFFF'FF02ULL);
 constexpr auto kMultiDraftTag = quint64(0xFFFF'FFFF'FFFF'FF03ULL);
@@ -2998,6 +3004,8 @@ void Account::writeExportSettings(const Export::Settings &settings) {
 		&& settings.fullChats == check.fullChats
 		&& settings.media.types == check.media.types
 		&& settings.media.sizeLimit == check.media.sizeLimit
+		&& settings.media.sizeLimits == check.media.sizeLimits
+		&& settings.reusePreviousMedia == check.reusePreviousMedia
 		&& settings.path == check.path
 		&& settings.format == check.format
 		&& settings.availableAt == check.availableAt
@@ -3015,7 +3023,10 @@ void Account::writeExportSettings(const Export::Settings &settings) {
 	}
 	quint32 size = sizeof(quint32) * 6
 		+ Serialize::stringSize(settings.path)
-		+ sizeof(qint32) * 2 + sizeof(quint64);
+		+ sizeof(qint32) * 2 + sizeof(quint64)
+		+ sizeof(quint32) * 4
+		+ (sizeof(quint32) + sizeof(quint64))
+			* settings.media.sizeLimits.size();
 	EncryptedDescriptor data(size);
 	data.stream
 		<< quint32(settings.types)
@@ -3048,6 +3059,17 @@ void Account::writeExportSettings(const Export::Settings &settings) {
 	});
 	data.stream << qint32(settings.singlePeerFrom);
 	data.stream << qint32(settings.singlePeerTill);
+
+	// Patched export fields, appended after everything the official client
+	// writes, so the official client still reads this file and ignores them.
+	data.stream
+		<< kExportPatchMagic
+		<< kExportPatchVersion
+		<< quint32(settings.reusePreviousMedia ? 1 : 0)
+		<< quint32(settings.media.sizeLimits.size());
+	for (const auto &[type, limit] : settings.media.sizeLimits) {
+		data.stream << quint32(type) << quint64(limit);
+	}
 
 	FileWriteDescriptor file(_exportSettingsKey, _basePath);
 	file.writeEncrypted(data, _localKey);
@@ -3104,11 +3126,40 @@ Export::Settings Account::readExportSettings() {
 	if (!file.stream.atEnd()) {
 		file.stream >> singlePeerFrom >> singlePeerTill;
 	}
+	quint32 patchMagic = 0, patchVersion = 0;
+	quint32 reusePreviousMedia = 1, sizeLimitsCount = 0;
+	auto sizeLimits = base::flat_map<Export::MediaSettings::Type, int64>();
+	if (!file.stream.atEnd()) {
+		file.stream >> patchMagic >> patchVersion;
+		if (patchMagic == kExportPatchMagic && patchVersion >= 1) {
+			file.stream >> reusePreviousMedia >> sizeLimitsCount;
+			if (sizeLimitsCount > kExportPatchSizeLimitsMax) {
+				sizeLimitsCount = 0;
+			}
+			for (auto i = quint32(); i != sizeLimitsCount; ++i) {
+				quint32 type = 0;
+				quint64 limit = 0;
+				file.stream >> type >> limit;
+				sizeLimits.emplace(
+					Export::MediaSettings::Type(type),
+					int64(limit));
+			}
+		}
+		if (patchMagic != kExportPatchMagic
+			|| file.stream.status() != QDataStream::Ok) {
+			// Not our block or a broken one, keep the defaults for it.
+			file.stream.resetStatus();
+			reusePreviousMedia = 1;
+			sizeLimits.clear();
+		}
+	}
 	auto result = Export::Settings();
 	result.types = Export::Settings::Types::from_raw(types);
 	result.fullChats = Export::Settings::Types::from_raw(fullChats);
 	result.media.types = Export::MediaSettings::Types::from_raw(mediaTypes);
 	result.media.sizeLimit = mediaSizeLimit;
+	result.media.sizeLimits = std::move(sizeLimits);
+	result.reusePreviousMedia = (reusePreviousMedia != 0);
 	result.format = Export::Output::Format(format);
 	result.path = path;
 	result.availableAt = availableAt;

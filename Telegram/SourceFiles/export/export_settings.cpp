@@ -22,7 +22,33 @@ bool MediaSettings::validate() const {
 	} else if (sizeLimit < 0 || sizeLimit > kMaxFileSize) {
 		return false;
 	}
+	for (const auto &[type, limit] : sizeLimits) {
+		if ((Types(type) | Type::AllMask) != Type::AllMask
+			|| limit < 0
+			|| limit > kMaxFileSize) {
+			return false;
+		}
+	}
 	return true;
+}
+
+int64 MediaSettings::sizeLimitFor(Type type) const {
+	const auto i = sizeLimits.find(type);
+	return (i != end(sizeLimits)) ? i->second : sizeLimit;
+}
+
+void MediaSettings::setSizeLimit(Type type, int64 limit) {
+	sizeLimits[type] = limit;
+}
+
+int64 MediaSettings::maxSizeLimit() const {
+	auto result = int64(0);
+	for (const auto type : kAllTypes) {
+		if (types & type) {
+			result = std::max(result, sizeLimitFor(type));
+		}
+	}
+	return result;
 }
 
 bool Settings::validate() const {
