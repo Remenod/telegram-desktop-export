@@ -1,4 +1,4 @@
 # Sub-releases of our own packaging changes on top of an Arch version:
 # "<arch pkgver>-<arch pkgrel> <n>" makes our pkgrel "<arch pkgrel>.<n>".
 # A line only matters while Arch is at that version.
-7.3.1-1 1  # /usr/bin/telegram-desktop link, like telegram-desktop-bin
+7.3.1-1 2  # export downloads files in parallel 1 MB parts
