@@ -18,6 +18,10 @@ git init --quiet work/tdesktop
 cd work/tdesktop
 git config user.name Remenod
 git config user.email remenod@gmail.com
+# A background gc after one fetch may rewrite the shallow file while the
+# next fetch reads it ("shallow file has changed since we read it").
+git config gc.auto 0
+git config maintenance.auto false
 
 if git ls-remote --exit-code --heads "$fork" "$branch" >/dev/null; then
   echo "using the existing $branch"
