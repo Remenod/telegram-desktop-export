@@ -292,40 +292,38 @@ private:
 		Fn<bool(FileProgress)> progress,
 		FnMut<void(QString)> done);
 	void loadFilePart();
-	void filePartRequest(int64 offset);
+	void filePartRequest(int64 offset, int limit);
+	[[nodiscard]] bool filePartFinished(uint64 randomId, int64 offset);
 	void filePartDone(int64 offset, const MTPupload_File &result);
 	void filePartFail(int64 offset, const MTP::Error &error);
-	void filePartTemporaryFail(int64 offset, const QString &reason);
-	void filePartWatchStall(int64 offset);
+	void filePartTemporaryFail(const QString &reason);
+	void filePartWatchStall(
+		int64 offset,
+		mtpRequestId requestId,
+		crl::time delay);
 	void filePartStalled(
 		int64 offset,
 		uint64 randomId,
 		mtpRequestId requestId,
 		bool online);
+	void filePartsCancel();
+	void filePartsReset();
 	void filePartGiveUp(const QString &reason);
 	void filePartUnavailable();
 	void callDelayed(crl::time delay, Fn<void()> callback);
 	[[nodiscard]] QString filePartMediaFolder() const;
-	void filePartRetryReference(
-		int64 offset,
-		Data::FileLocation location);
-	void filePartRefreshReference(int64 offset);
+	void filePartRetryReference(Data::FileLocation location);
+	void filePartRefreshReference();
 	void filePartExtractCustomEmojiReference(
-		int64 offset,
 		uint64 customEmojiId,
 		const QString &folder,
 		const MTPVector<MTPDocument> &result);
 	void filePartExtractRichReference(
-		int64 offset,
 		const Data::FileOrigin &origin,
 		const QString &folder,
 		const MTPmessages_Messages &result);
-	void filePartExtractReference(
-		int64 offset,
-		const MTPmessages_Messages &result);
-	void filePartExtractReference(
-		int64 offset,
-		const MTPstories_Stories &result);
+	void filePartExtractReference(const MTPmessages_Messages &result);
+	void filePartExtractReference(const MTPstories_Stories &result);
 
 	template <typename Request>
 	class RequestBuilder;
@@ -338,7 +336,8 @@ private:
 
 	[[nodiscard]] auto fileRequest(
 		const Data::FileLocation &location,
-		int64 offset);
+		int64 offset,
+		int limit);
 
 	void error(const MTP::Error &error);
 	void error(const QString &text);
@@ -363,6 +362,9 @@ private:
 	std::unique_ptr<ProfileMusicProcess> _profileMusicProcess;
 	std::unique_ptr<OtherDataProcess> _otherDataProcess;
 	std::unique_ptr<FileProcess> _fileProcess;
+
+	// Set once a file part didn't arrive in time: small parts from then on.
+	bool _fileSlowConnection = false;
 	std::unique_ptr<LeftChannelsProcess> _leftChannelsProcess;
 	std::unique_ptr<DialogsProcess> _dialogsProcess;
 	std::unique_ptr<ChatProcess> _chatProcess;

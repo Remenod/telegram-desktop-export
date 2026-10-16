@@ -35,9 +35,12 @@ namespace Export {
 namespace {
 
 constexpr auto kUserpicsSliceLimit = 100;
-constexpr auto kFileChunkSize = 128 * 1024;
-constexpr auto kFileRequestsCount = 2;
-//constexpr auto kFileNextRequestDelay = crl::time(20);
+// The most upload.getFile gives at once; parts in flight are written in
+// order. A connection where a whole part doesn't arrive in time gets the
+// small parts tdesktop used before for the rest of the export.
+constexpr auto kFileChunkSize = 1024 * 1024;
+constexpr auto kFileChunkSizeSlow = 128 * 1024;
+constexpr auto kFileRequestsCount = 4;
 
 // A file part that keeps failing with temporary errors (5xx, timeouts)
 // or doesn't answer at all is given up instead of being retried forever.
@@ -589,9 +592,11 @@ struct ApiWrap::FileProcess {
 	struct Request {
 		int64 offset = 0;
 		QByteArray bytes;
+		mtpRequestId requestId = 0;
 	};
 	std::deque<Request> requests;
-	mtpRequestId requestId = 0;
+	mtpRequestId referenceRequestId = 0;
+	crl::time lastPart = 0;
 
 	// Reset on every received part.
 	int temporaryErrors = 0;
@@ -1031,22 +1036,27 @@ auto ApiWrap::splitRequest(int index, Request &&request) {
 		std::forward<Request>(request)));
 }
 
-auto ApiWrap::fileRequest(const Data::FileLocation &location, int64 offset) {
+auto ApiWrap::fileRequest(
+		const Data::FileLocation &location,
+		int64 offset,
+		int limit) {
 	Expects(location.dcId != 0
 		|| location.data.type() == mtpc_inputTakeoutFileLocation);
 	Expects(_takeoutId.has_value());
-	Expects(_fileProcess->requestId == 0);
+	Expects(_fileProcess != nullptr);
 
+	const auto randomId = _fileProcess->randomId;
 	return std::move(_mtp.request(MTPInvokeWithTakeout<MTPupload_GetFile>(
 		MTP_long(*_takeoutId),
 		MTPupload_GetFile(
 			MTP_flags(0),
 			location.data,
 			MTP_long(offset),
-			MTP_int(kFileChunkSize))
+			MTP_int(limit))
 	)).fail([=](const MTP::Error &result) {
-		_fileProcess->requestId = 0;
-		filePartFail(offset, result);
+		if (filePartFinished(randomId, offset)) {
+			filePartFail(offset, result);
+		}
 	}).handleAllErrors(
 	).toDC(MTP::ShiftDcId(location.dcId, MTP::kExportMediaDcShift)));
 }
@@ -2175,12 +2185,7 @@ void ApiWrap::skipFile(uint64 randomId) {
 		return;
 	}
 	LOG(("Export Info: File skipped."));
-	Assert(!_fileProcess->requests.empty());
-
-	// No request is in flight while a retry of a failed part is pending.
-	if (_fileProcess->requestId) {
-		_mtp.request(base::take(_fileProcess->requestId)).cancel();
-	}
+	filePartsCancel();
 	base::take(_fileProcess)->done(QString());
 }
 
@@ -3754,9 +3759,10 @@ void ApiWrap::loadFile(
 		}
 	}
 
+	_fileProcess->lastPart = crl::now();
 	loadFilePart();
 
-	Ensures(_fileProcess->requestId != 0);
+	Ensures(!_fileProcess->requests.empty());
 }
 
 auto ApiWrap::prepareFileProcess(
@@ -3780,50 +3786,71 @@ auto ApiWrap::prepareFileProcess(
 }
 
 void ApiWrap::loadFilePart() {
-	if (!_fileProcess
-		|| _fileProcess->requestId
-		|| _fileProcess->requests.size() >= kFileRequestsCount
-		|| (_fileProcess->size > 0
-			&& _fileProcess->offset >= _fileProcess->size)) {
+	if (!_fileProcess || _fileProcess->referenceRequestId) {
 		return;
 	}
 
-	const auto offset = _fileProcess->offset;
-	_fileProcess->requests.push_back({ offset });
-	_fileProcess->offset += kFileChunkSize;
-	filePartRequest(offset);
-
-	if (_fileProcess->size > 0
-		&& _fileProcess->requests.size() < kFileRequestsCount) {
-		// Only one request at a time supported right now.
-		//const auto runner = _runner;
-		//crl::on_main([=] {
-		//	QTimer::singleShot(kFileNextRequestDelay, [=] {
-		//		runner([=] {
-		//			loadFilePart();
-		//		});
-		//	});
-		//});
+	// The end of a file of unknown size shows only as an empty part, so
+	// its parts go one at a time.
+	const auto known = (_fileProcess->size > 0);
+	const auto limit = known ? kFileRequestsCount : 1;
+	const auto chunk = _fileSlowConnection
+		? kFileChunkSizeSlow
+		: kFileChunkSize;
+	auto &requests = _fileProcess->requests;
+	while (int(requests.size()) < limit
+		&& (!known || _fileProcess->offset < _fileProcess->size)) {
+		const auto offset = _fileProcess->offset;
+		requests.push_back({ offset });
+		_fileProcess->offset += chunk;
+		filePartRequest(offset, chunk);
 	}
 }
 
-void ApiWrap::filePartRequest(int64 offset) {
+void ApiWrap::filePartRequest(int64 offset, int limit) {
 	Expects(_fileProcess != nullptr);
-	Expects(_fileProcess->requestId == 0);
 
-	_fileProcess->requestId = fileRequest(
+	const auto randomId = _fileProcess->randomId;
+	const auto requestId = fileRequest(
 		_fileProcess->location,
-		offset
+		offset,
+		limit
 	).done([=](const MTPupload_File &result) {
-		_fileProcess->requestId = 0;
-		filePartDone(offset, result);
+		if (filePartFinished(randomId, offset)) {
+			filePartDone(offset, result);
+		}
 	}).send();
-	filePartWatchStall(offset);
+
+	using Request = FileProcess::Request;
+	auto &requests = _fileProcess->requests;
+	const auto i = ranges::find(
+		requests,
+		offset,
+		[](const Request &request) { return request.offset; });
+	Assert(i != end(requests));
+	i->requestId = requestId;
+	filePartWatchStall(offset, requestId, kFilePartTimeout);
+}
+
+bool ApiWrap::filePartFinished(uint64 randomId, int64 offset) {
+	if (!_fileProcess || _fileProcess->randomId != randomId) {
+		return false;
+	}
+	using Request = FileProcess::Request;
+	auto &requests = _fileProcess->requests;
+	const auto i = ranges::find(
+		requests,
+		offset,
+		[](const Request &request) { return request.offset; });
+	if (i == end(requests) || !i->requestId) {
+		return false;
+	}
+	i->requestId = 0;
+	return true;
 }
 
 void ApiWrap::filePartFail(int64 offset, const MTP::Error &result) {
 	Expects(_fileProcess != nullptr);
-	Expects(_fileProcess->requestId == 0);
 
 	const auto &type = result.type();
 	if (type == u"TAKEOUT_FILE_EMPTY"_q && _otherDataProcess != nullptr) {
@@ -3839,28 +3866,32 @@ void ApiWrap::filePartFail(int64 offset, const MTP::Error &result) {
 		filePartUnavailable();
 	} else if (result.code() == 400
 		&& type.startsWith(u"FILE_REFERENCE_"_q)) {
-		filePartRefreshReference(offset);
+		filePartsReset();
+		filePartRefreshReference();
 	} else if (MTP::IsFloodError(result)) {
 		// Flood waits are expected during a long export, honor them.
 		const auto seconds = type.mid(type.lastIndexOf('_') + 1).toInt();
 		const auto delay = std::max(seconds, 1) * crl::time(1000);
-		LOG(("Export Info: File part flood wait %1s.").arg(seconds));
+		LOG(("Export Info: File part flood wait %1s (%2)."
+			).arg(seconds
+			).arg(type));
+		filePartsReset();
 		const auto randomId = _fileProcess->randomId;
 		const auto serial = ++_fileProcess->retrySerial;
 		callDelayed(delay, [=] {
 			if (_fileProcess
 				&& _fileProcess->randomId == randomId
 				&& _fileProcess->retrySerial == serial
-				&& !_fileProcess->requestId) {
-				filePartRequest(offset);
+				&& _fileProcess->requests.empty()) {
+				loadFilePart();
 			}
 		});
 	} else if (MTP::IsTemporaryError(result)) {
-		filePartTemporaryFail(
-			offset,
-			QString::number(result.code()) + ' ' + type);
+		filePartsReset();
+		filePartTemporaryFail(QString::number(result.code()) + ' ' + type);
 	} else if (type.startsWith(u"TAKEOUT_"_q)) {
 		// The takeout session itself is broken, the export can't go on.
+		filePartsCancel();
 		error(result);
 	} else {
 		// Any other error concerns only this file, not the whole export.
@@ -3868,9 +3899,8 @@ void ApiWrap::filePartFail(int64 offset, const MTP::Error &result) {
 	}
 }
 
-void ApiWrap::filePartTemporaryFail(int64 offset, const QString &reason) {
+void ApiWrap::filePartTemporaryFail(const QString &reason) {
 	Expects(_fileProcess != nullptr);
-	Expects(_fileProcess->requestId == 0);
 
 	const auto attempt = ++_fileProcess->temporaryErrors;
 	if (attempt > kFileTemporaryErrorsLimit) {
@@ -3893,22 +3923,23 @@ void ApiWrap::filePartTemporaryFail(int64 offset, const QString &reason) {
 		if (_fileProcess
 			&& _fileProcess->randomId == randomId
 			&& _fileProcess->retrySerial == serial
-			&& !_fileProcess->requestId) {
-			filePartRequest(offset);
+			&& _fileProcess->requests.empty()) {
+			loadFilePart();
 		}
 	});
 }
 
-void ApiWrap::filePartWatchStall(int64 offset) {
+void ApiWrap::filePartWatchStall(
+		int64 offset,
+		mtpRequestId requestId,
+		crl::time delay) {
 	Expects(_fileProcess != nullptr);
-	Expects(_fileProcess->requestId != 0);
 
 	// The MTP layer may keep a request waiting without ever failing it.
 	// The connection state is read on the main thread, where MTP lives.
 	const auto randomId = _fileProcess->randomId;
-	const auto requestId = _fileProcess->requestId;
 	crl::on_main([=, instance = _instance, runner = _runner] {
-		QTimer::singleShot(int(kFilePartTimeout), [=] {
+		QTimer::singleShot(int(delay), [=] {
 			const auto strong = instance.get();
 			const auto online = strong
 				&& (strong->dcstate() == MTP::ConnectedState);
@@ -3924,26 +3955,76 @@ void ApiWrap::filePartStalled(
 		uint64 randomId,
 		mtpRequestId requestId,
 		bool online) {
-	if (!_fileProcess
-		|| _fileProcess->randomId != randomId
-		|| _fileProcess->requestId != requestId) {
+	if (!_fileProcess || _fileProcess->randomId != randomId) {
+		return;
+	}
+	using Request = FileProcess::Request;
+	const auto &requests = _fileProcess->requests;
+	const auto i = ranges::find(
+		requests,
+		offset,
+		[](const Request &request) { return request.offset; });
+	if (i == end(requests) || i->requestId != requestId) {
 		return;
 	}
 	if (!online) {
 		// No connection at all is not a problem of this file: keep the
 		// request, MTP sends it again once the connection is back.
 		LOG(("Export Info: No connection, still waiting for a file part."));
-		filePartWatchStall(offset);
+		filePartWatchStall(offset, requestId, kFilePartTimeout);
 		return;
 	}
-	_mtp.request(base::take(_fileProcess->requestId)).cancel();
+
+	// Parts in flight arrive one after another, so a part may wait long
+	// on a slow connection: the file is stalled only when no part at all
+	// arrives for the whole timeout.
+	const auto waited = crl::now() - _fileProcess->lastPart;
+	if (waited < kFilePartTimeout) {
+		filePartWatchStall(offset, requestId, kFilePartTimeout - waited);
+		return;
+	}
+	filePartsReset();
 	if (++_fileProcess->stalls >= kFileStallsLimit) {
 		filePartGiveUp(u"no answer for a file part %1 times in a row"_q
 			.arg(_fileProcess->stalls));
+		return;
+	}
+	if (!_fileSlowConnection) {
+		_fileSlowConnection = true;
+		LOG(("Export Info: File part got no answer in %1s, "
+			"using %2 KB parts from now on."
+			).arg(kFilePartTimeout / 1000
+			).arg(kFileChunkSizeSlow / 1024));
 	} else {
 		LOG(("Export Info: File part got no answer in %1s, retrying."
 			).arg(kFilePartTimeout / 1000));
-		filePartRequest(offset);
+	}
+	loadFilePart();
+}
+
+void ApiWrap::filePartsCancel() {
+	Expects(_fileProcess != nullptr);
+
+	for (auto &request : _fileProcess->requests) {
+		if (request.requestId) {
+			_mtp.request(base::take(request.requestId)).cancel();
+		}
+	}
+	if (_fileProcess->referenceRequestId) {
+		_mtp.request(base::take(_fileProcess->referenceRequestId)).cancel();
+	}
+}
+
+void ApiWrap::filePartsReset() {
+	Expects(_fileProcess != nullptr);
+
+	// After a failed part everything from it on is requested again, parts
+	// that arrived out of order included: they are written in order only.
+	filePartsCancel();
+	auto &requests = _fileProcess->requests;
+	if (!requests.empty()) {
+		_fileProcess->offset = requests.front().offset;
+		requests.clear();
 	}
 }
 
@@ -3988,6 +4069,7 @@ void ApiWrap::filePartDone(int64 offset, const MTPupload_File &result) {
 	_fileProcess->temporaryErrors = 0;
 	_fileProcess->stalls = 0;
 	_fileProcess->referenceRefreshes = 0;
+	_fileProcess->lastPart = crl::now();
 	if (result.type() == mtpc_upload_fileCdnRedirect) {
 		filePartGiveUp(u"CDN redirect is not supported"_q);
 		return;
@@ -4019,6 +4101,7 @@ void ApiWrap::filePartDone(int64 offset, const MTPupload_File &result) {
 		while (!requests.empty() && !requests.front().bytes.isEmpty()) {
 			const auto &bytes = requests.front().bytes;
 			if (const auto result = file.writeBlock(bytes); !result) {
+				filePartsCancel();
 				ioError(result);
 				return;
 			}
@@ -4055,19 +4138,18 @@ QString ApiWrap::filePartMediaFolder() const {
 	return QString();
 }
 
-void ApiWrap::filePartRetryReference(
-		int64 offset,
-		Data::FileLocation location) {
+void ApiWrap::filePartRetryReference(Data::FileLocation location) {
 	Expects(_fileProcess != nullptr);
-	Expects(_fileProcess->requestId == 0);
+	Expects(_fileProcess->referenceRequestId == 0);
 
 	_fileProcess->location = std::move(location);
-	filePartRequest(offset);
+	loadFilePart();
 }
 
-void ApiWrap::filePartRefreshReference(int64 offset) {
+void ApiWrap::filePartRefreshReference() {
 	Expects(_fileProcess != nullptr);
-	Expects(_fileProcess->requestId == 0);
+	Expects(_fileProcess->referenceRequestId == 0);
+	Expects(_fileProcess->requests.empty());
 
 	// A reference the server keeps rejecting must not loop forever.
 	if (++_fileProcess->referenceRefreshes > kFileReferenceRefreshesLimit) {
@@ -4076,34 +4158,34 @@ void ApiWrap::filePartRefreshReference(int64 offset) {
 	}
 	const auto origin = _fileProcess->origin;
 	if (origin.storyId) {
-		_fileProcess->requestId = mainRequest(MTPstories_GetStoriesByID(
-			MTP_inputPeerSelf(),
-			MTP_vector<MTPint>(1, MTP_int(origin.storyId))
-		)).fail([=](const MTP::Error &error) {
-			_fileProcess->requestId = 0;
+		_fileProcess->referenceRequestId = mainRequest(
+			MTPstories_GetStoriesByID(
+				MTP_inputPeerSelf(),
+				MTP_vector<MTPint>(1, MTP_int(origin.storyId)))
+		).fail([=](const MTP::Error &error) {
+			_fileProcess->referenceRequestId = 0;
 			filePartUnavailable();
 			return true;
 		}).done([=](const MTPstories_Stories &result) {
-			_fileProcess->requestId = 0;
-			filePartExtractReference(offset, result);
+			_fileProcess->referenceRequestId = 0;
+			filePartExtractReference(result);
 		}).send();
 		return;
 	}
 	if (origin.customEmojiId) {
 		const auto folder = filePartMediaFolder();
-		_fileProcess->requestId = mainRequest(
+		_fileProcess->referenceRequestId = mainRequest(
 			MTPmessages_GetCustomEmojiDocuments(
 				MTP_vector<MTPlong>(
 					1,
 					MTP_long(origin.customEmojiId)))
 		).fail([=](const MTP::Error &) {
-			_fileProcess->requestId = 0;
+			_fileProcess->referenceRequestId = 0;
 			filePartUnavailable();
 			return true;
 		}).done([=](const MTPVector<MTPDocument> &result) {
-			_fileProcess->requestId = 0;
+			_fileProcess->referenceRequestId = 0;
 			filePartExtractCustomEmojiReference(
-				offset,
 				origin.customEmojiId,
 				folder,
 				result);
@@ -4116,17 +4198,17 @@ void ApiWrap::filePartRefreshReference(int64 offset) {
 			return;
 		}
 		const auto folder = filePartMediaFolder();
-		_fileProcess->requestId = mainRequest(MTPmessages_GetRichMessage(
-			origin.peer,
-			MTP_int(origin.messageId)
-		)).fail([=](const MTP::Error &) {
-			_fileProcess->requestId = 0;
+		_fileProcess->referenceRequestId = mainRequest(
+			MTPmessages_GetRichMessage(
+				origin.peer,
+				MTP_int(origin.messageId))
+		).fail([=](const MTP::Error &) {
+			_fileProcess->referenceRequestId = 0;
 			filePartUnavailable();
 			return true;
 		}).done([=](const MTPmessages_Messages &result) {
-			_fileProcess->requestId = 0;
+			_fileProcess->referenceRequestId = 0;
 			filePartExtractRichReference(
-				offset,
 				origin,
 				folder,
 				result);
@@ -4147,21 +4229,21 @@ void ApiWrap::filePartRefreshReference(int64 offset) {
 				origin.peer.c_inputPeerChannelFromMessage().vpeer(),
 				origin.peer.c_inputPeerChannelFromMessage().vmsg_id(),
 				origin.peer.c_inputPeerChannelFromMessage().vchannel_id());
-		_fileProcess->requestId = mainRequest(MTPchannels_GetMessages(
+		_fileProcess->referenceRequestId = mainRequest(MTPchannels_GetMessages(
 			channel,
 			MTP_vector<MTPInputMessage>(
 				1,
 				MTP_inputMessageID(MTP_int(origin.messageId)))
 		)).fail([=](const MTP::Error &error) {
-			_fileProcess->requestId = 0;
+			_fileProcess->referenceRequestId = 0;
 			filePartUnavailable();
 			return true;
 		}).done([=](const MTPmessages_Messages &result) {
-			_fileProcess->requestId = 0;
-			filePartExtractReference(offset, result);
+			_fileProcess->referenceRequestId = 0;
+			filePartExtractReference(result);
 		}).send();
 	} else {
-		_fileProcess->requestId = splitRequest(
+		_fileProcess->referenceRequestId = splitRequest(
 			origin.split,
 			MTPmessages_GetMessages(
 				MTP_vector<MTPInputMessage>(
@@ -4169,23 +4251,22 @@ void ApiWrap::filePartRefreshReference(int64 offset) {
 					MTP_inputMessageID(MTP_int(origin.messageId)))
 			)
 		).fail([=](const MTP::Error &error) {
-			_fileProcess->requestId = 0;
+			_fileProcess->referenceRequestId = 0;
 			filePartUnavailable();
 			return true;
 		}).done([=](const MTPmessages_Messages &result) {
-			_fileProcess->requestId = 0;
-			filePartExtractReference(offset, result);
+			_fileProcess->referenceRequestId = 0;
+			filePartExtractReference(result);
 		}).send();
 	}
 }
 
 void ApiWrap::filePartExtractCustomEmojiReference(
-		int64 offset,
 		uint64 customEmojiId,
 		const QString &folder,
 		const MTPVector<MTPDocument> &result) {
 	Expects(_fileProcess != nullptr);
-	Expects(_fileProcess->requestId == 0);
+	Expects(_fileProcess->referenceRequestId == 0);
 	Expects(_selfId.has_value());
 
 	auto context = Data::ParseMediaContext();
@@ -4223,16 +4304,15 @@ void ApiWrap::filePartExtractCustomEmojiReference(
 		filePartUnavailable();
 		return;
 	}
-	filePartRetryReference(offset, std::move(refreshed));
+	filePartRetryReference(std::move(refreshed));
 }
 
 void ApiWrap::filePartExtractRichReference(
-		int64 offset,
 		const Data::FileOrigin &origin,
 		const QString &folder,
 		const MTPmessages_Messages &result) {
 	Expects(_fileProcess != nullptr);
-	Expects(_fileProcess->requestId == 0);
+	Expects(_fileProcess->referenceRequestId == 0);
 	Expects(_selfId.has_value());
 
 	const auto richMessage = ExtractFullRichMessage(
@@ -4260,14 +4340,13 @@ void ApiWrap::filePartExtractRichReference(
 		filePartUnavailable();
 		return;
 	}
-	filePartRetryReference(offset, *refreshed);
+	filePartRetryReference(*refreshed);
 }
 
 void ApiWrap::filePartExtractReference(
-		int64 offset,
 		const MTPmessages_Messages &result) {
 	Expects(_fileProcess != nullptr);
-	Expects(_fileProcess->requestId == 0);
+	Expects(_fileProcess->referenceRequestId == 0);
 
 	const auto folder = filePartMediaFolder();
 	result.match([&](const MTPDmessages_messagesNotModified &data) {
@@ -4292,9 +4371,7 @@ void ApiWrap::filePartExtractReference(
 					|| Data::RefreshFileReference(
 						refreshed,
 						message.thumb().file.location)) {
-					filePartRetryReference(
-						offset,
-						std::move(refreshed));
+					filePartRetryReference(std::move(refreshed));
 					return;
 				}
 			}
@@ -4304,10 +4381,9 @@ void ApiWrap::filePartExtractReference(
 }
 
 void ApiWrap::filePartExtractReference(
-		int64 offset,
 		const MTPstories_Stories &result) {
 	Expects(_fileProcess != nullptr);
-	Expects(_fileProcess->requestId == 0);
+	Expects(_fileProcess->referenceRequestId == 0);
 
 	const auto stories = Data::ParseStoriesSlice(
 		result.data().vstories(),
@@ -4321,9 +4397,7 @@ void ApiWrap::filePartExtractReference(
 				|| Data::RefreshFileReference(
 					refreshed,
 					story.thumb().file.location)) {
-				filePartRetryReference(
-					offset,
-					std::move(refreshed));
+				filePartRetryReference(std::move(refreshed));
 				return;
 			}
 		}
@@ -4333,10 +4407,10 @@ void ApiWrap::filePartExtractReference(
 
 void ApiWrap::filePartUnavailable() {
 	Expects(_fileProcess != nullptr);
-	Expects(!_fileProcess->requests.empty());
 
 	LOG(("Export Error: File unavailable."));
 
+	filePartsCancel();
 	base::take(_fileProcess)->done(QString());
 }
 
