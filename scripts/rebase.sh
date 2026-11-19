@@ -4,7 +4,8 @@
 # If the fork has a branch export/v$PKGVER already (made here before, or
 # fixed by hand after a conflict), it is used as is. Otherwise the commits
 # of the newest export/v* branch are cherry-picked onto the release tag and
-# pushed as export/v$PKGVER. The result is work/export-patches.patch.
+# pushed as export/v$PKGVER with the deploy key (secret PUSH_SSH_KEY). The
+# result is work/export-patches.patch.
 set -euo pipefail
 : "${PKGVER:?}" "${REPO:?}" "${GH_TOKEN:?}"
 
@@ -12,6 +13,7 @@ upstream=https://github.com/telegramdesktop/tdesktop.git
 fork="https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git"
 tag="v${PKGVER}"
 branch="export/v${PKGVER}"
+known_hosts="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/github_known_hosts"
 
 mkdir -p work
 git init --quiet work/tdesktop
@@ -55,7 +57,17 @@ else
     exit 1
   fi
   if [[ -z "${DRY_RUN:-}" ]]; then
-    git push --quiet "$fork" "$branch"
+    # Upstream's history between two releases sometimes changes its
+    # .github/workflows files, and GITHUB_TOKEN can never push such commits
+    # ("refusing to allow a GitHub App to create or update workflow ...
+    # without workflows permission"). The branch goes out over SSH with the
+    # read-write deploy key of this repository (secret PUSH_SSH_KEY).
+    : "${PUSH_SSH_KEY:?the deploy key secret PUSH_SSH_KEY is not set}"
+    key=$(mktemp)
+    trap 'rm -f "$key"' EXIT
+    printf '%s\n' "$PUSH_SSH_KEY" > "$key"
+    GIT_SSH_COMMAND="ssh -i $key -o IdentitiesOnly=yes -o UserKnownHostsFile=$known_hosts -o StrictHostKeyChecking=yes" \
+      git push --quiet "git@github.com:${REPO}.git" "$branch"
   fi
 fi
 

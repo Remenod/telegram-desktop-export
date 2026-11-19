@@ -50,7 +50,10 @@ on top of upstream's release tags.
    Telegram Desktop needs too.
 2. `scripts/rebase.sh` — uses `export/v<pkgver>` if it exists, otherwise
    cherry-picks the newest `export/v*` branch onto the release tag and pushes
-   it as `export/v<pkgver>`.
+   it as `export/v<pkgver>`. The push goes over SSH with a read-write deploy
+   key of this repository (secret `PUSH_SSH_KEY`, host keys pinned in
+   `github_known_hosts`): upstream's history between two releases sometimes
+   changes `.github/workflows`, and `GITHUB_TOKEN` can never push that.
 3. `scripts/make_pkgbuilds.py` — takes Arch's PKGBUILD of that exact version
    and changes only the name, provides/conflicts, `!lto`, and applies the patch
    in `prepare()`.

@@ -78,6 +78,8 @@ jobs:
       - name: Get the packaging scripts
         run: git clone --quiet --depth 1 --branch "${{ github.ref_name }}" "https://github.com/${REPO}.git" packaging
       - name: Put the patches onto the release
+        env:
+          PUSH_SSH_KEY: ${{ secrets.PUSH_SSH_KEY }}
         run: bash packaging/scripts/rebase.sh
       - name: Make PKGBUILDs from Arch's
         run: python3 packaging/scripts/make_pkgbuilds.py
